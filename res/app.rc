@@ -1,0 +1,38 @@
+#pragma code_page(65001)
+/* app.rc —— 应用资源：图标、清单、版本信息 */
+#include <windows.h>
+
+1 ICON "app.ico"
+
+/* RT_MANIFEST = 24，ID 1 = 进程清单 */
+1 24 "app.manifest"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    1,0,0,0
+ PRODUCTVERSION 1,0,0,0
+ FILEFLAGSMASK  0x3fL
+ FILEFLAGS      0x0L
+ FILEOS         0x40004L
+ FILETYPE       0x1L
+ FILESUBTYPE    0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404b0"
+        BEGIN
+            VALUE "CompanyName",      "开院 · 内测"
+            VALUE "FileDescription",  "FileCE"
+            VALUE "FileVersion",      "1.0.0.0"
+            VALUE "InternalName",     "FileCE"
+            VALUE "LegalCopyright",   "独立实现，不含第三方运行时"
+            VALUE "OriginalFilename", "FileCE.exe"
+            VALUE "ProductName",      "FileCE"
+            VALUE "ProductVersion",   "1.0.0.0"
+            VALUE "Comments",         "Windows 7 SP1 x64 ~ Windows 11；静态链接单文件"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0804, 1200
+    END
+END
