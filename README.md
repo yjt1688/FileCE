@@ -7,7 +7,7 @@
 [![Star 数](https://img.shields.io/github/stars/yjt1688/FileCE?label=stars)](https://github.com/yjt1688/FileCE/stargazers)
 [![开源协议](https://img.shields.io/github/license/yjt1688/FileCE?label=license)](LICENSE)
 
-![主界面预览](docs/screenshot.png)
+![主界面截图](docs/screenshot.png)
 
 ## 功能 / 性能
 
