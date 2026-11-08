@@ -17,10 +17,19 @@ CFLAGS = ["-std=c17", "-Os", "-municode", "-mwindows",
           "-Wall", "-Wextra", "-Wno-unused-parameter", "-Wno-cast-function-type",
           "-DUNICODE", "-D_UNICODE", "-D_WIN32_WINNT=0x0601", "-DWINVER=0x0601",
           "-ffunction-sections", "-fdata-sections", "-fno-strict-aliasing",
+          # 关键：不加这个，x64 的 .pdata/.xdata 会从 3.9KB 涨到 9.4KB
+          # （每函数一条 12 字节的 RUNTIME_FUNCTION）。实测 exe 直接多 2.5KB，
+          # 而且会把 -flto 省下来的代码体积全部吃掉。
+          # 本程序不用 __try/__except，删异步 unwind 表是安全的。
+          "-fno-asynchronous-unwind-tables",
+          # 注意：Makefile 里那套 -fno-peephole2 / -fno-reorder-blocks /
+          # -fno-tree-vectorize 等**不要**加 —— 它们是禁用优化，实测会让
+          # .text 涨 3.5KB（152,528 vs 149,008），反而更大。
           "-flto=1", "--param", "ggc-min-expand=20",
           "--param", "ggc-min-heapsize=65536"]
 LDFLAGS = ["-municode", "-mwindows", "-static", "-static-libgcc", "-s", "-flto=1",
-           "-Wl,--gc-sections",
+           "-Wl,--gc-sections", "-Wl,--nxcompat", "-Wl,--dynamicbase",
+           "-Wl,-O1", "-Wl,--sort-common",
            "-lcomctl32", "-lshell32", "-lshlwapi", "-lole32", "-luuid",
            "-lgdi32", "-luser32", "-ladvapi32", "-lcomdlg32", "-luxtheme",
            "-lkernel32"]

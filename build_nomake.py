@@ -7,16 +7,15 @@ os.chdir(BASE)
 CC = r"C:\mingw64\bin\x86_64-w64-mingw32-gcc.exe"
 WINDRES = r"C:\mingw64\bin\windres.exe"
 
+# 与 Makefile 保持一致：-flto=1 + 只留 -fno-asynchronous-unwind-tables
+# （那套 -fno-peephole2 / -fno-reorder-blocks 是禁用优化，会让 .text 涨 3.5KB）
 CFLAGS = ("-std=c17 -Os -municode -mwindows "
           "-Wall -Wextra -Wno-unused-parameter -Wno-cast-function-type "
           "-DUNICODE -D_UNICODE -D_WIN32_WINNT=0x0601 -DWINVER=0x0601 "
           "-ffunction-sections -fdata-sections -fno-strict-aliasing "
-          "-fno-asynchronous-unwind-tables -fomit-frame-pointer "
-          "-fno-stack-check -fno-stack-protector -fno-ident "
-          "-fno-math-errno -fno-tree-vectorize "
-          "-fno-align-functions -fno-align-loops -fno-align-jumps "
-          "-fno-reorder-blocks -fno-peephole2").split()
-LDFLAGS = ("-municode -mwindows -static -static-libgcc -s "
+          "-fno-asynchronous-unwind-tables "
+          "-flto=1").split()
+LDFLAGS = ("-municode -mwindows -static -static-libgcc -s -flto=1 "
            "-Wl,--gc-sections -Wl,--nxcompat -Wl,--dynamicbase "
            "-Wl,-O1 -Wl,--sort-common "
            "-lcomctl32 -lshell32 -lshlwapi -lole32 -luuid "
