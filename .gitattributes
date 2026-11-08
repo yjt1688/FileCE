@@ -1,0 +1,24 @@
+# ---- 换行符统一 ----
+# 全部文本按 LF 存储、按 LF 检出（磁盘上本来就是 LF，这样不会再有
+# "LF will be replaced by CRLF" 的警告，diff 也不会整文件抖动）
+* text=auto eol=lf
+
+# ---- 显式声明文本类型（便于编辑器/工具识别）----
+*.c        text eol=lf
+*.h        text eol=lf
+*.py       text eol=lf
+*.md       text eol=lf
+*.rc       text eol=lf
+*.manifest text eol=lf
+*.txt      text eol=lf
+.gitignore text eol=lf
+Makefile   text eol=lf
+
+# ---- 二进制：不做任何换行/编码转换 ----
+*.bmp      binary
+*.png      binary
+*.jpg      binary
+*.ico      binary
+*.exe      binary
+*.o        binary
+*.res      binary
