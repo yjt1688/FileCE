@@ -890,7 +890,278 @@ static void conflict_unique_name(const wchar_t *dstDir, const wchar_t *name,
     } while (fs_path_exists(out) && n < 999);
 }
 
-static bool copy_tree_plain(const wchar_t *src, const wchar_t *dst)
+/* ---------------- 复制进度 ----------------
+ * 原来 CopyFileExW 的进度回调传 NULL，整个复制同步跑在 UI 线程上：
+ * 复制一个几百 MB 的文件，窗口就完全没响应（拖不动、不重绘、像死机）。
+ * 现在给它一个真回调，在回调里：
+ *   1) 泵消息 —— 窗口能重绘、能拖动、能响应关闭
+ *   2) 标题栏显示百分比 —— 不另开进度窗口
+ *   3) 按 Esc 取消
+ */
+static HWND  s_cpOwner = NULL;
+static BOOL  s_cpCancel = FALSE;
+
+static void prog_dlg_create(HWND owner);
+static void prog_dlg_update(int perMille, const wchar_t *name);
+static HWND s_progDlg   = NULL;
+static HWND s_progBar   = NULL;
+static HWND s_progText  = NULL;
+static HWND s_progName  = NULL;
+static HWND s_progBytes = NULL;
+static bool s_progAtomsReady = false;
+
+/* 速度与剩余时间：用滑动窗口算瞬时速度，避免数字乱跳 */
+static ULONGLONG s_progTick   = 0;      /* 上次采样时刻 */
+static LONGLONG  s_progDone   = 0;      /* 上次采样时的已复制字节 */
+static double    s_progMBps   = 0.0;    /* 当前速度 MB/s */
+
+static void prog_dlg_set_bytes(double doneMB, double totalMB);
+static void prog_dlg_destroy(void);
+
+static DWORD CALLBACK copy_progress(LARGE_INTEGER total, LARGE_INTEGER done,
+                                    LARGE_INTEGER streamSize, LARGE_INTEGER streamDone,
+                                    DWORD streamNo, DWORD reason,
+                                    HANDLE hSrc, HANDLE hDst, LPVOID data)
+{
+    (void)streamSize; (void)streamDone; (void)streamNo;
+    (void)hSrc; (void)hDst; (void)data;
+
+    if (reason != CALLBACK_CHUNK_FINISHED && reason != CALLBACK_STREAM_SWITCH)
+        return PROGRESS_CONTINUE;
+
+    /* 泵消息：不泵的话 UI 线程被 CopyFileExW 占死，窗口一动不动 */
+    MSG msg;
+    while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
+        if (msg.message == WM_QUIT) {
+            s_cpCancel = TRUE;
+            PostQuitMessage((int)msg.wParam);
+            break;
+        }
+        if (msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE)
+            s_cpCancel = TRUE;
+        /* 别把命令派发进去：复制中途再触发一次粘贴会重入 */
+        if (msg.message == WM_COMMAND || msg.message == WM_PASTE ||
+            msg.message == WM_DROPFILES) {
+            continue;
+        }
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    if (total.QuadPart > 0) {
+        /* 每 200ms 采一次速度，减少抖动 */
+        ULONGLONG now = GetTickCount64();
+        if (s_progTick && now - s_progTick >= 200) {
+            LONGLONG db = done.QuadPart - s_progDone;
+            ULONGLONG dm = now - s_progTick;
+            if (db > 0 && dm > 0) {
+                double inst = (double)db / 1048576.0 * 1000.0 / (double)dm;
+                /* 指数平滑，避免单个采样尖峰让数字乱跳 */
+                s_progMBps = s_progMBps > 0.1 ? (s_progMBps * 0.6 + inst * 0.4) : inst;
+            }
+            s_progDone = done.QuadPart;
+            s_progTick = now;
+        } else if (!s_progTick) {
+            s_progTick = now;
+            s_progDone = done.QuadPart;
+        }
+
+        int perMille = (int)(done.QuadPart * 1000 / total.QuadPart);
+        prog_dlg_update(perMille, NULL);
+        prog_dlg_set_bytes((double)done.QuadPart / 1048576.0,
+                           (double)total.QuadPart / 1048576.0);
+    }
+
+    return s_cpCancel ? PROGRESS_CANCEL : PROGRESS_CONTINUE;
+}
+
+/* ---------------- 复制进度对话框 ----------------
+ * 无模式窗口（复制本身跑在 UI 线程，靠 copy_progress 泵消息驱动），
+ * 所以不能用 DialogBox 那种模态循环。控件全部手建，不依赖 .rc。
+ */
+
+
+static LRESULT CALLBACK prog_dlg_proc(HWND h, UINT m, WPARAM wp, LPARAM lp)
+{
+    switch (m) {
+    case WM_CREATE:
+        return 0;
+    case WM_COMMAND:
+        if (LOWORD(wp) == 1001) {         /* 取消按钮 */
+            s_cpCancel = TRUE;
+            return 0;
+        }
+        break;
+    case WM_CLOSE:                        /* 点 X 也当取消 */
+        s_cpCancel = TRUE;
+        return 0;
+    case WM_DESTROY:
+        return 0;
+    }
+    return DefWindowProcW(h, m, wp, lp);
+}
+
+static void prog_dlg_create(HWND owner)
+{
+    if (s_progDlg) return;
+
+    HINSTANCE hi = GetModuleHandleW(NULL);
+    if (!s_progAtomsReady) {
+        WNDCLASSEXW wc;
+        ZeroMemory(&wc, sizeof(wc));
+        wc.cbSize        = sizeof(wc);
+        wc.lpfnWndProc   = prog_dlg_proc;
+        wc.hInstance     = hi;
+        wc.hCursor       = LoadCursorW(NULL, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = L"FFCopyProgress";
+        RegisterClassExW(&wc);            /* 已注册会失败，忽略即可 */
+        s_progAtomsReady = true;
+    }
+
+    RECT orc;
+    GetWindowRect(owner, &orc);
+    int w = 500, h = 146;
+    int x = orc.left + ((orc.right - orc.left) - w) / 2;
+    int y = orc.top + ((orc.bottom - orc.top) - h) / 2;
+
+    s_progDlg = CreateWindowExW(
+        WS_EX_DLGMODALFRAME, L"FFCopyProgress", L"正在复制",
+        WS_POPUP | WS_CAPTION | WS_SYSMENU,
+        x, y, w, h, owner, NULL, hi, NULL);
+    if (!s_progDlg) return;
+
+    s_progName = CreateWindowExW(0, L"STATIC", L"",
+        WS_CHILD | WS_VISIBLE | SS_PATHELLIPSIS,
+        16, 12, w - 40, 20, s_progDlg, NULL, hi, NULL);
+
+    /* 百分比文字：原来只有 120px 宽，"26% （Esc 取消）" 被截成 "（Esc 取" */
+    s_progText = CreateWindowExW(0, L"STATIC", L"0%",
+        WS_CHILD | WS_VISIBLE,
+        16, 40, w - 40, 20, s_progDlg, NULL, hi, NULL);
+
+    s_progBar = CreateWindowExW(0, PROGRESS_CLASSW, NULL,
+        WS_CHILD | WS_VISIBLE,
+        16, 68, w - 40, 24, s_progDlg, NULL, hi, NULL);
+    SendMessageW(s_progBar, PBM_SETRANGE32, 0, 1000);
+
+    /* 进度条下面一行：已复制 / 总量 */
+    s_progBytes = CreateWindowExW(0, L"STATIC", L"",
+        WS_CHILD | WS_VISIBLE,
+        16, 96, w - 140, 18, s_progDlg, NULL, hi, NULL);
+
+    HWND btn = CreateWindowExW(0, L"BUTTON", L"取消",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        w - 120, 100, 88, 26, s_progDlg, (HMENU)(INT_PTR)1001, hi, NULL);
+
+    /* 统一用 GUI 字体，否则静态控件会用 SYSTEM_FONT（粗体大字，看着像标题） */
+    HFONT gui = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    HWND controls[5];
+    controls[0] = s_progName;
+    controls[1] = s_progText;
+    controls[2] = s_progBar;
+    controls[3] = btn;
+    controls[4] = s_progBytes;
+    for (int i = 0; i < 5; ++i) {
+        if (controls[i]) SendMessageW(controls[i], WM_SETFONT, (WPARAM)gui, TRUE);
+    }
+
+    ShowWindow(s_progDlg, SW_SHOWNOACTIVATE);
+    UpdateWindow(s_progDlg);
+}
+
+static void prog_dlg_update(int perMille, const wchar_t *name)
+{
+    if (!s_progDlg) return;
+    if (perMille >= 0) {
+        if (s_progBar) SendMessageW(s_progBar, PBM_SETPOS, perMille, 0);
+        if (s_progText) {
+            wchar_t t[32];
+            StringCchPrintfW(t, 32, L"%d%%  （Esc 取消）", perMille / 10);
+            SetWindowTextW(s_progText, t);
+        }
+    }
+    if (s_progName && name) {
+        SetWindowTextW(s_progName, name);      /* SS_PATHELLIPSIS 自动截长路径 */
+    }
+}
+
+static void prog_dlg_set_bytes(double doneMB, double totalMB)
+{
+    if (!s_progBytes) return;
+
+    wchar_t size[64];
+    if (totalMB >= 1024.0)
+        StringCchPrintfW(size, 64, L"%.1f GB / %.1f GB",
+                         doneMB / 1024.0, totalMB / 1024.0);
+    else
+        StringCchPrintfW(size, 64, L"%.0f MB / %.0f MB", doneMB, totalMB);
+
+    wchar_t tail[64] = L"";
+    if (s_progMBps >= 0.1) {
+        double remainMB = totalMB - doneMB;
+        if (remainMB < 0) remainMB = 0;
+        int remainSec = (int)(remainMB / s_progMBps + 0.5);
+
+        wchar_t speed[40], eta[40];
+        StringCchPrintfW(speed, 40, L"%.1f MB/s", s_progMBps);
+        if (remainSec >= 3600)
+            StringCchPrintfW(eta, 40, L"剩余 %d:%02d:%02d",
+                             remainSec / 3600, (remainSec / 60) % 60, remainSec % 60);
+        else if (remainSec >= 60)
+            StringCchPrintfW(eta, 40, L"剩余 %d 分 %d 秒",
+                             remainSec / 60, remainSec % 60);
+        else
+            StringCchPrintfW(eta, 40, L"剩余 %d 秒", remainSec);
+        StringCchPrintfW(tail, 64, L"  ·  %s  ·  %s", speed, eta);
+    }
+
+    wchar_t all[220];
+    StringCchPrintfW(all, 220, L"%s%s", size, tail);
+    SetWindowTextW(s_progBytes, all);
+}
+
+static void prog_dlg_destroy(void)
+{
+    if (s_progDlg) {
+        DestroyWindow(s_progDlg);
+        s_progDlg = NULL;
+        s_progBar = NULL;
+        s_progText = NULL;
+        s_progName = NULL;
+        s_progBytes = NULL;
+    }
+}
+
+/* 复制单个文件，带进度泵和取消。结束后把标题还原。 */
+static bool copy_one_file(const wchar_t *s, const wchar_t *d)
+{
+    HWND ow = s_cpOwner;
+    wchar_t saved[512] = L"";
+    if (ow) GetWindowTextW(ow, saved, 512);
+    prog_dlg_update(-1, s);      /* 对话框里显示当前在复制哪个文件 */
+
+    bool ok = false;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        s_cpCancel = FALSE;
+        if (CopyFileExW(s, d, copy_progress, NULL, &s_cpCancel, 0)) {
+            ok = true;
+            break;
+        }
+        DWORD e = GetLastError();
+        if (e == ERROR_REQUEST_ABORTED) break;          /* 用户按了 Esc */
+        if (e == ERROR_SHARING_VIOLATION || e == ERROR_LOCK_VIOLATION) {
+            Sleep(120);
+            continue;                                    /* 文件被占用，重试 */
+        }
+        break;
+    }
+
+    if (ow && saved[0]) SetWindowTextW(ow, saved);
+    return ok;
+}
+
+static bool copy_tree_plain(HWND owner, const wchar_t *src, const wchar_t *dst)
 {
     if (!CreateDirectoryW(dst, NULL) && GetLastError() != ERROR_ALREADY_EXISTS)
         return false;
@@ -906,10 +1177,10 @@ static bool copy_tree_plain(const wchar_t *src, const wchar_t *dst)
         ff_path_join(s2, FF_PATH_MAX, src, fd.cFileName);
         ff_path_join(d2, FF_PATH_MAX, dst, fd.cFileName);
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            if (!copy_tree_plain(s2, d2)) ok = false;
+            if (!copy_tree_plain(owner, s2, d2)) ok = false;
         } else {
             SetFileAttributesW(d2, FILE_ATTRIBUTE_NORMAL);
-            if (!CopyFileExW(s2, d2, NULL, NULL, NULL, 0)) ok = false;
+            if (!copy_one_file(s2, d2)) { ok = false; if (s_cpCancel) break; }
         }
     } while (FindNextFileW(h, &fd));
     FindClose(h);
@@ -921,6 +1192,15 @@ bool fs_copy_move(HWND owner, const wchar_t **src, int count, const wchar_t *dst
 {
     if (err && cchErr) err[0] = 0;
     if (!src || count <= 0 || !dstDir || !dstDir[0]) return false;
+
+    /* 复制期间用它更新标题栏进度（copy_progress 里读） */
+    HWND prevOwner = s_cpOwner;
+    s_cpOwner = owner;
+    s_cpCancel = FALSE;
+    prog_dlg_create(owner);          /* 进度对话框：进度条 + 百分比 + 取消 */
+    s_progTick = 0;
+    s_progDone = 0;
+    s_progMBps = 0.0;
 
     ConflictAct policy = CF_ASK;
     bool ok = true;
@@ -982,8 +1262,8 @@ bool fs_copy_move(HWND owner, const wchar_t **src, int count, const wchar_t *dst
                                                 (unsigned long)GetLastError());
             continue;
         }
-        bool r = isDir ? copy_tree_plain(src[i], final)
-                       : (CopyFileExW(src[i], final, NULL, NULL, NULL, 0) != 0);
+        bool r = isDir ? copy_tree_plain(owner, src[i], final)
+                       : copy_one_file(src[i], final);
         if (r) { ++done; continue; }
         ok = false;
         if (err && cchErr) StringCchPrintfW(err, cchErr, L"复制失败（错误码 %lu）。",
@@ -991,6 +1271,8 @@ bool fs_copy_move(HWND owner, const wchar_t **src, int count, const wchar_t *dst
     }
 
     DBG(L"fs_copy_move: 完成 %d/%d ok=%d", done, count, ok ? 1 : 0);
+    prog_dlg_destroy();
+    s_cpOwner = prevOwner;
     return ok && done > 0;
 }
 
